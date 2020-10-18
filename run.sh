@@ -1,52 +1,82 @@
-#!/bin/bash
+#!/usr/bin/env sh
 set -eu
 
-BUILD="Release"
+BINARY_DIR="$(dirname "$(readlink -f "$0")")/out/result"
+CONFIG_PATH="config/ASF.json"
 
-UNTIL_CLEAN_EXIT=0
-
-ASF_ARGS=("")
-
-PRINT_USAGE() {
-	echo "Usage: $0 [--until-clean-exit] [--cryptkey=] [--path=] [--server] [debug/release]"
+if [ ! -d "$BINARY_DIR" ]; then
+	echo "ERROR: $BINARY_DIR could not be found!"
 	exit 1
+fi
+
+cd "$BINARY_DIR"
+
+BINARY_PATH="$(pwd)/ArchiSteamFarm.dll"
+
+if [ ! -f "$BINARY_PATH" ]; then
+	echo "ERROR: $BINARY_PATH could not be found!"
+	exit 1
+fi
+
+BINARY_ARGS=""
+PATH_NEXT=0
+
+PARSE_ARG() {
+	BINARY_ARGS="$BINARY_ARGS $1"
+
+	case "$1" in
+		--path) PATH_NEXT=1 ;;
+		--path=*)
+			if [ "$PATH_NEXT" -eq 1 ]; then
+				PATH_NEXT=0
+				cd "$1"
+			else
+				cd "$(echo "$1" | cut -d '=' -f 2-)"
+			fi
+			;;
+		*)
+			if [ "$PATH_NEXT" -eq 1 ]; then
+				PATH_NEXT=0
+				cd "$1"
+			fi
+	esac
 }
 
-for ARG in "$@"; do
-	case "$ARG" in
-		release|Release) BUILD="Release" ;;
-		debug|Debug) BUILD="Debug" ;;
-		--cryptkey=*) ASF_ARGS+=("$ARG") ;;
-		--path=*) ASF_ARGS+=("$ARG") ;;
-		--server) ASF_ARGS+=("$ARG") ;;
-		--until-clean-exit) UNTIL_CLEAN_EXIT=1 ;;
-		*) PRINT_USAGE
-	esac
-done
-
-cd "$(dirname "$(readlink -f "$0")")"
-
-if [[ -f "mono_envsetup.sh" ]]; then
-	set +u
-	source "mono_envsetup.sh"
-	set -u
+if [ -n "${ASF_PATH-}" ]; then
+	cd "$ASF_PATH"
 fi
 
-BINARY="ArchiSteamFarm/bin/$BUILD/ArchiSteamFarm.exe"
+if [ -n "${ASF_ARGS-}" ]; then
+	for ARG in $ASF_ARGS; do
+		if [ -n "$ARG" ]; then
+			PARSE_ARG "$ARG"
+		fi
+	done
+fi
 
-if [[ ! -f "$BINARY" ]]; then
-	echo "ERROR: $BINARY could not be found!"
+for ARG in "$@"; do
+	if [ -n "$ARG" ]; then
+		PARSE_ARG "$ARG"
+	fi
+done
+
+CONFIG_PATH="$(pwd)/${CONFIG_PATH}"
+
+# Kill underlying ASF process on shell process exit
+trap "trap - TERM && kill -- -$$" INT TERM
+
+if ! command -v dotnet >/dev/null; then
+	echo "ERROR: dotnet CLI tools are not installed!"
 	exit 1
 fi
 
-if [[ "$UNTIL_CLEAN_EXIT" -eq 0 ]]; then
-	mono "$BINARY" "${ASF_ARGS[@]}"
-	exit $?
-fi
+dotnet --info
 
-while [[ -f "$BINARY" ]]; do
-	if mono "$BINARY" "${ASF_ARGS[@]}"; then
-		break
-	fi
-	sleep 1
-done
+if [ -f "$CONFIG_PATH" ] && grep -Eq '"Headless":\s+?true' "$CONFIG_PATH"; then
+	# We're running ASF in headless mode so we don't need STDIN
+	dotnet "$BINARY_PATH" $BINARY_ARGS & # Start ASF in the background, trap will work properly due to non-blocking call
+	wait $! # This will forward dotnet error code, set -e will abort the script if it's non-zero
+else
+	# We're running ASF in non-headless mode, so we need STDIN to be operative
+	dotnet "$BINARY_PATH" $BINARY_ARGS # Start ASF in the foreground, trap won't work until process exit
+fi

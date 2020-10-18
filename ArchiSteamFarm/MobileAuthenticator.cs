@@ -1,263 +1,278 @@
-﻿/*
-    _                _      _  ____   _                           _____
-   / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
-  / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
- / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
-/_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
-
- Copyright 2015-2017 Łukasz "JustArchi" Domeradzki
- Contact: JustArchi@JustArchi.net
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
- http://www.apache.org/licenses/LICENSE-2.0
-					
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+//     _                _      _  ____   _                           _____
+//    / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
+//   / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
+//  / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
+// /_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
+// |
+// Copyright 2015-2020 Łukasz "JustArchi" Domeradzki
+// Contact: JustArchi@JustArchi.net
+// |
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// |
+// http://www.apache.org/licenses/LICENSE-2.0
+// |
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using ArchiSteamFarm.JSON;
-using HtmlAgilityPack;
+using AngleSharp.Dom;
+using ArchiSteamFarm.Helpers;
+using ArchiSteamFarm.Localization;
+using JetBrains.Annotations;
 using Newtonsoft.Json;
 
 namespace ArchiSteamFarm {
 	[SuppressMessage("ReSharper", "ClassCannotBeInstantiated")]
-	[SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
-	internal sealed class MobileAuthenticator : IDisposable {
-		private const byte CodeDigits = 5;
+	public sealed class MobileAuthenticator : IDisposable {
+		internal const byte BackupCodeDigits = 7;
+		internal const byte CodeDigits = 5;
+
 		private const byte CodeInterval = 30;
+		private const byte SteamTimeTTL = 24; // For how many hours we can assume that SteamTimeDifference is correct
 
-		private static readonly char[] CodeCharacters = { '2', '3', '4', '5', '6', '7', '8', '9', 'B', 'C', 'D', 'F', 'G', 'H', 'J', 'K', 'M', 'N', 'P', 'Q', 'R', 'T', 'V', 'W', 'X', 'Y' };
-		private static readonly SemaphoreSlim TimeSemaphore = new SemaphoreSlim(1);
+		internal static readonly ImmutableSortedSet<char> CodeCharacters = ImmutableSortedSet.Create('2', '3', '4', '5', '6', '7', '8', '9', 'B', 'C', 'D', 'F', 'G', 'H', 'J', 'K', 'M', 'N', 'P', 'Q', 'R', 'T', 'V', 'W', 'X', 'Y');
 
-		private static short? SteamTimeDifference;
+		private static readonly SemaphoreSlim TimeSemaphore = new SemaphoreSlim(1, 1);
 
-		internal bool HasCorrectDeviceID => !string.IsNullOrEmpty(DeviceID) && !DeviceID.Equals("ERROR"); // "ERROR" is being used by SteamDesktopAuthenticator
+		private static DateTime LastSteamTimeCheck;
+		private static int? SteamTimeDifference;
 
-		private readonly SemaphoreSlim ConfirmationsSemaphore = new SemaphoreSlim(1);
+		private readonly ArchiCacheable<string> CachedDeviceID;
 
-		private Bot Bot;
+#pragma warning disable 649
+		[JsonProperty(PropertyName = "identity_secret", Required = Required.Always)]
+		private readonly string? IdentitySecret;
+#pragma warning restore 649
 
-		[JsonProperty(PropertyName = "device_id")]
-		private string DeviceID;
+#pragma warning disable 649
+		[JsonProperty(PropertyName = "shared_secret", Required = Required.Always)]
+		private readonly string? SharedSecret;
+#pragma warning restore 649
 
-		private MobileAuthenticator() { }
+		private Bot? Bot;
 
-		public void Dispose() => ConfirmationsSemaphore.Dispose();
+		[JsonConstructor]
+		private MobileAuthenticator() => CachedDeviceID = new ArchiCacheable<string>(ResolveDeviceID);
 
-		internal void CorrectDeviceID(string deviceID) {
-			if (string.IsNullOrEmpty(deviceID)) {
-				Bot.ArchiLogger.LogNullError(nameof(deviceID));
-				return;
-			}
+		public void Dispose() => CachedDeviceID.Dispose();
 
-			DeviceID = deviceID;
-		}
-
-		internal async Task<string> GenerateToken() {
-			uint time = await GetSteamTime().ConfigureAwait(false);
-			if (time != 0) {
-				return GenerateTokenForTime(time);
-			}
-
-			Bot.ArchiLogger.LogNullError(nameof(time));
-			return null;
-		}
-
-		internal async Task<Steam.ConfirmationDetails> GetConfirmationDetails(Confirmation confirmation) {
-			if (confirmation == null) {
-				Bot.ArchiLogger.LogNullError(nameof(confirmation));
-				return null;
-			}
-
-			if (!HasCorrectDeviceID) {
-				Bot.ArchiLogger.LogGenericWarning("Can't execute properly due to invalid DeviceID!");
-				return null;
+		internal async Task<string?> GenerateToken() {
+			if (Bot == null) {
+				throw new ArgumentNullException(nameof(Bot));
 			}
 
 			uint time = await GetSteamTime().ConfigureAwait(false);
+
 			if (time == 0) {
-				Bot.ArchiLogger.LogNullError(nameof(time));
+				throw new ArgumentNullException(nameof(time));
+			}
+
+			return GenerateTokenForTime(time);
+		}
+
+		internal async Task<HashSet<Confirmation>?> GetConfirmations() {
+			if (Bot == null) {
+				throw new ArgumentNullException(nameof(Bot));
+			}
+
+			(bool success, string? deviceID) = await CachedDeviceID.GetValue().ConfigureAwait(false);
+
+			if (!success || string.IsNullOrEmpty(deviceID)) {
+				Bot.ArchiLogger.LogGenericError(string.Format(Strings.WarningFailedWithError, nameof(deviceID)));
+
 				return null;
 			}
 
-			string confirmationHash = GenerateConfirmationKey(time, "conf");
+			uint time = await GetSteamTime().ConfigureAwait(false);
+
+			if (time == 0) {
+				throw new ArgumentNullException(nameof(time));
+			}
+
+			string? confirmationHash = GenerateConfirmationHash(time, "conf");
+
 			if (string.IsNullOrEmpty(confirmationHash)) {
 				Bot.ArchiLogger.LogNullError(nameof(confirmationHash));
+
 				return null;
 			}
 
-			Steam.ConfirmationDetails response = await Bot.ArchiWebHandler.GetConfirmationDetails(DeviceID, confirmationHash, time, confirmation).ConfigureAwait(false);
-			if ((response == null) || !response.Success) {
-				return null;
-			}
+			await LimitConfirmationsRequestsAsync().ConfigureAwait(false);
 
-			return response;
-		}
+			using IDocument? htmlDocument = await Bot.ArchiWebHandler.GetConfirmationsPage(deviceID!, confirmationHash!, time).ConfigureAwait(false);
 
-		internal async Task<HashSet<Confirmation>> GetConfirmations() {
-			if (!HasCorrectDeviceID) {
-				Bot.ArchiLogger.LogGenericWarning("Can't execute properly due to invalid DeviceID!");
-				return null;
-			}
-
-			uint time = await GetSteamTime().ConfigureAwait(false);
-			if (time == 0) {
-				Bot.ArchiLogger.LogNullError(nameof(time));
-				return null;
-			}
-
-			string confirmationHash = GenerateConfirmationKey(time, "conf");
-			if (string.IsNullOrEmpty(confirmationHash)) {
-				Bot.ArchiLogger.LogNullError(nameof(confirmationHash));
-				return null;
-			}
-
-			HtmlDocument htmlDocument = await Bot.ArchiWebHandler.GetConfirmations(DeviceID, confirmationHash, time).ConfigureAwait(false);
-
-			HtmlNodeCollection confirmationNodes = htmlDocument?.DocumentNode.SelectNodes("//div[@class='mobileconf_list_entry']");
-			if (confirmationNodes == null) {
+			if (htmlDocument == null) {
 				return null;
 			}
 
 			HashSet<Confirmation> result = new HashSet<Confirmation>();
 
-			foreach (HtmlNode confirmationNode in confirmationNodes) {
-				string idString = confirmationNode.GetAttributeValue("data-confid", null);
-				if (string.IsNullOrEmpty(idString)) {
-					Bot.ArchiLogger.LogNullError(nameof(idString));
+			List<IElement> confirmationNodes = htmlDocument.SelectNodes("//div[@class='mobileconf_list_entry']");
+
+			if (confirmationNodes.Count == 0) {
+				return result;
+			}
+
+			foreach (IElement confirmationNode in confirmationNodes) {
+				string? idText = confirmationNode.GetAttribute("data-confid");
+
+				if (string.IsNullOrEmpty(idText)) {
+					Bot.ArchiLogger.LogNullError(nameof(idText));
+
 					return null;
 				}
 
-				uint id;
-				if (!uint.TryParse(idString, out id) || (id == 0)) {
+				if (!ulong.TryParse(idText, out ulong id) || (id == 0)) {
 					Bot.ArchiLogger.LogNullError(nameof(id));
+
 					return null;
 				}
 
-				string keyString = confirmationNode.GetAttributeValue("data-key", null);
-				if (string.IsNullOrEmpty(keyString)) {
-					Bot.ArchiLogger.LogNullError(nameof(keyString));
+				string? keyText = confirmationNode.GetAttribute("data-key");
+
+				if (string.IsNullOrEmpty(keyText)) {
+					Bot.ArchiLogger.LogNullError(nameof(keyText));
+
 					return null;
 				}
 
-				ulong key;
-				if (!ulong.TryParse(keyString, out key) || (key == 0)) {
+				if (!ulong.TryParse(keyText, out ulong key) || (key == 0)) {
 					Bot.ArchiLogger.LogNullError(nameof(key));
+
 					return null;
 				}
 
-				HtmlNode descriptionNode = confirmationNode.SelectSingleNode(".//div[@class='mobileconf_list_entry_description']/div");
-				if (descriptionNode == null) {
-					Bot.ArchiLogger.LogNullError(nameof(descriptionNode));
+				string? creatorText = confirmationNode.GetAttribute("data-creator");
+
+				if (string.IsNullOrEmpty(creatorText)) {
+					Bot.ArchiLogger.LogNullError(nameof(creatorText));
+
 					return null;
 				}
 
-				Steam.ConfirmationDetails.EType type;
+				if (!ulong.TryParse(creatorText, out ulong creator) || (creator == 0)) {
+					Bot.ArchiLogger.LogNullError(nameof(creator));
 
-				string description = descriptionNode.InnerText;
-				if (description.StartsWith("Sell - ", StringComparison.Ordinal)) {
-					type = Steam.ConfirmationDetails.EType.Market;
-				} else if (description.StartsWith("Trade with ", StringComparison.Ordinal)) {
-					type = Steam.ConfirmationDetails.EType.Trade;
-				} else {
-					Bot.ArchiLogger.LogGenericWarning("Received unknown confirmation type, please report this: " + description);
-					type = Steam.ConfirmationDetails.EType.Other;
+					return null;
 				}
 
-				result.Add(new Confirmation(id, key, type));
+				string? typeText = confirmationNode.GetAttribute("data-type");
+
+				if (string.IsNullOrEmpty(typeText)) {
+					Bot.ArchiLogger.LogNullError(nameof(typeText));
+
+					return null;
+				}
+
+				if (!Enum.TryParse(typeText, out Confirmation.EType type) || (type == Confirmation.EType.Unknown)) {
+					Bot.ArchiLogger.LogNullError(nameof(type));
+
+					return null;
+				}
+
+				if (!Enum.IsDefined(typeof(Confirmation.EType), type)) {
+					Bot.ArchiLogger.LogGenericError(string.Format(Strings.WarningUnknownValuePleaseReport, nameof(type), type));
+
+					return null;
+				}
+
+				result.Add(new Confirmation(id, key, creator, type));
 			}
 
 			return result;
 		}
 
-		internal async Task<bool> HandleConfirmations(HashSet<Confirmation> confirmations, bool accept) {
-			if ((confirmations == null) || (confirmations.Count == 0)) {
-				Bot.ArchiLogger.LogNullError(nameof(confirmations));
+		internal async Task<bool> HandleConfirmations(IReadOnlyCollection<Confirmation> confirmations, bool accept) {
+			if ((confirmations == null) || (confirmations.Count == 0) || (Bot == null)) {
+				throw new ArgumentNullException(nameof(confirmations) + " || " + nameof(Bot));
+			}
+
+			(bool success, string? deviceID) = await CachedDeviceID.GetValue().ConfigureAwait(false);
+
+			if (!success || string.IsNullOrEmpty(deviceID)) {
+				Bot.ArchiLogger.LogGenericError(string.Format(Strings.WarningFailedWithError, nameof(deviceID)));
+
 				return false;
 			}
 
-			if (!HasCorrectDeviceID) {
-				Bot.ArchiLogger.LogGenericWarning("Can't execute properly due to invalid DeviceID!");
+			uint time = await GetSteamTime().ConfigureAwait(false);
+
+			if (time == 0) {
+				throw new ArgumentNullException(nameof(time));
+			}
+
+			string? confirmationHash = GenerateConfirmationHash(time, "conf");
+
+			if (string.IsNullOrEmpty(confirmationHash)) {
+				Bot.ArchiLogger.LogNullError(nameof(confirmationHash));
+
 				return false;
 			}
 
-			await ConfirmationsSemaphore.WaitAsync().ConfigureAwait(false);
+			bool? result = await Bot.ArchiWebHandler.HandleConfirmations(deviceID!, confirmationHash!, time, confirmations, accept).ConfigureAwait(false);
+
+			if (!result.HasValue) {
+				// Request timed out
+				return false;
+			}
+
+			if (result.Value) {
+				// Request succeeded
+				return true;
+			}
+
+			// Our multi request failed, this is almost always Steam issue that happens randomly
+			// In this case, we'll accept all pending confirmations one-by-one, synchronously (as Steam can't handle them in parallel)
+			// We totally ignore actual result returned by those calls, abort only if request timed out
+			foreach (Confirmation confirmation in confirmations) {
+				bool? confirmationResult = await Bot.ArchiWebHandler.HandleConfirmation(deviceID!, confirmationHash!, time, confirmation.ID, confirmation.Key, accept).ConfigureAwait(false);
+
+				if (!confirmationResult.HasValue) {
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		internal void Init(Bot bot) => Bot = bot ?? throw new ArgumentNullException(nameof(bot));
+
+		private string? GenerateConfirmationHash(uint time, string? tag = null) {
+			if ((time == 0) || (Bot == null) || string.IsNullOrEmpty(IdentitySecret)) {
+				throw new ArgumentNullException(nameof(time) + " || " + nameof(Bot) + " || " + nameof(IdentitySecret));
+			}
+
+			byte[] identitySecret;
 
 			try {
-				uint time = await GetSteamTime().ConfigureAwait(false);
-				if (time == 0) {
-					Bot.ArchiLogger.LogNullError(nameof(time));
-					return false;
-				}
+				identitySecret = Convert.FromBase64String(IdentitySecret!);
+			} catch (FormatException e) {
+				Bot.ArchiLogger.LogGenericException(e);
+				Bot.ArchiLogger.LogGenericError(string.Format(Strings.ErrorIsInvalid, nameof(IdentitySecret)));
 
-				string confirmationHash = GenerateConfirmationKey(time, "conf");
-				if (string.IsNullOrEmpty(confirmationHash)) {
-					Bot.ArchiLogger.LogNullError(nameof(confirmationHash));
-					return false;
-				}
-
-				bool? result = await Bot.ArchiWebHandler.HandleConfirmations(DeviceID, confirmationHash, time, confirmations, accept).ConfigureAwait(false);
-				if (!result.HasValue) { // Request timed out
-					return false;
-				}
-
-				if (result.Value) { // Request succeeded
-					return true;
-				}
-
-				// Our multi request failed, this is almost always Steam fuckup that happens randomly
-				// In this case, we'll accept all pending confirmations one-by-one, synchronously (as Steam can't handle them in parallel)
-				// We totally ignore actual result returned by those calls, abort only if request timed out
-
-				foreach (Confirmation confirmation in confirmations) {
-					bool? confirmationResult = await Bot.ArchiWebHandler.HandleConfirmation(DeviceID, confirmationHash, time, confirmation.ID, confirmation.Key, accept).ConfigureAwait(false);
-					if (!confirmationResult.HasValue) {
-						return false;
-					}
-				}
-
-				return true;
-			} finally {
-				ConfirmationsSemaphore.Release();
-			}
-		}
-
-		internal void Init(Bot bot) {
-			if (bot == null) {
-				throw new ArgumentNullException(nameof(bot));
-			}
-
-			Bot = bot;
-		}
-
-		private string GenerateConfirmationKey(uint time, string tag = null) {
-			if (time == 0) {
-				Bot.ArchiLogger.LogNullError(nameof(time));
 				return null;
 			}
 
-			byte[] identitySecret = Convert.FromBase64String(IdentitySecret);
-
 			byte bufferSize = 8;
+
 			if (!string.IsNullOrEmpty(tag)) {
-				bufferSize += (byte) Math.Min(32, tag.Length);
+				bufferSize += (byte) Math.Min(32, tag!.Length);
 			}
 
-			byte[] timeArray = BitConverter.GetBytes((long) time);
+			byte[] timeArray = BitConverter.GetBytes((ulong) time);
+
 			if (BitConverter.IsLittleEndian) {
 				Array.Reverse(timeArray);
 			}
@@ -265,38 +280,48 @@ namespace ArchiSteamFarm {
 			byte[] buffer = new byte[bufferSize];
 
 			Array.Copy(timeArray, buffer, 8);
+
 			if (!string.IsNullOrEmpty(tag)) {
-				Array.Copy(Encoding.UTF8.GetBytes(tag), 0, buffer, 8, bufferSize - 8);
+				Array.Copy(Encoding.UTF8.GetBytes(tag!), 0, buffer, 8, bufferSize - 8);
 			}
 
-			byte[] hash;
-			using (HMACSHA1 hmac = new HMACSHA1(identitySecret)) {
-				hash = hmac.ComputeHash(buffer);
-			}
+			using HMACSHA1 hmac = new HMACSHA1(identitySecret);
+
+			byte[] hash = hmac.ComputeHash(buffer);
 
 			return Convert.ToBase64String(hash);
 		}
 
-		private string GenerateTokenForTime(uint time) {
-			if (time == 0) {
-				Bot.ArchiLogger.LogNullError(nameof(time));
+		private string? GenerateTokenForTime(uint time) {
+			if ((time == 0) || (Bot == null) || string.IsNullOrEmpty(SharedSecret)) {
+				throw new ArgumentNullException(nameof(time) + " || " + nameof(Bot) + " || " + nameof(SharedSecret));
+			}
+
+			byte[] sharedSecret;
+
+			try {
+				sharedSecret = Convert.FromBase64String(SharedSecret!);
+			} catch (FormatException e) {
+				Bot.ArchiLogger.LogGenericException(e);
+				Bot.ArchiLogger.LogGenericError(string.Format(Strings.ErrorIsInvalid, nameof(SharedSecret)));
+
 				return null;
 			}
 
-			byte[] sharedSecret = Convert.FromBase64String(SharedSecret);
+			byte[] timeArray = BitConverter.GetBytes((ulong) (time / CodeInterval));
 
-			byte[] timeArray = BitConverter.GetBytes((long) time / CodeInterval);
 			if (BitConverter.IsLittleEndian) {
 				Array.Reverse(timeArray);
 			}
 
 			byte[] hash;
+
 			using (HMACSHA1 hmac = new HMACSHA1(sharedSecret)) {
 				hash = hmac.ComputeHash(timeArray);
 			}
 
 			// The last 4 bits of the mac say where the code starts
-			int start = hash[hash.Length - 1] & 0x0f;
+			int start = hash[^1] & 0x0f;
 
 			// Extract those 4 bytes
 			byte[] bytes = new byte[4];
@@ -310,59 +335,113 @@ namespace ArchiSteamFarm {
 			uint fullCode = BitConverter.ToUInt32(bytes, 0) & 0x7fffffff;
 
 			// Build the alphanumeric code
-			StringBuilder code = new StringBuilder();
+			char[] code = new char[CodeDigits];
 
 			for (byte i = 0; i < CodeDigits; i++) {
-				code.Append(CodeCharacters[fullCode % CodeCharacters.Length]);
-				fullCode /= (uint) CodeCharacters.Length;
+				code[i] = CodeCharacters[(byte) (fullCode % CodeCharacters.Count)];
+				fullCode /= (byte) CodeCharacters.Count;
 			}
 
-			return code.ToString();
+			return new string(code);
 		}
 
 		private async Task<uint> GetSteamTime() {
-			if (SteamTimeDifference.HasValue) {
-				return (uint) (Utilities.GetUnixTime() + SteamTimeDifference.GetValueOrDefault());
+			if (Bot == null) {
+				throw new ArgumentNullException(nameof(Bot));
+			}
+
+			if (SteamTimeDifference.HasValue && (DateTime.UtcNow.Subtract(LastSteamTimeCheck).TotalHours < SteamTimeTTL)) {
+				return (uint) (Utilities.GetUnixTime() + SteamTimeDifference.Value);
 			}
 
 			await TimeSemaphore.WaitAsync().ConfigureAwait(false);
 
 			try {
-				if (!SteamTimeDifference.HasValue) {
-					uint serverTime = Bot.ArchiWebHandler.GetServerTime();
-					if (serverTime != 0) {
-						SteamTimeDifference = (short) (serverTime - Utilities.GetUnixTime());
-					}
+				if (SteamTimeDifference.HasValue && (DateTime.UtcNow.Subtract(LastSteamTimeCheck).TotalHours < SteamTimeTTL)) {
+					return (uint) (Utilities.GetUnixTime() + SteamTimeDifference.Value);
 				}
+
+				uint serverTime = await Bot.ArchiWebHandler.GetServerTime().ConfigureAwait(false);
+
+				if (serverTime == 0) {
+					return Utilities.GetUnixTime();
+				}
+
+				SteamTimeDifference = (int) (serverTime - Utilities.GetUnixTime());
+				LastSteamTimeCheck = DateTime.UtcNow;
+
+				return (uint) (Utilities.GetUnixTime() + SteamTimeDifference.Value);
 			} finally {
 				TimeSemaphore.Release();
 			}
-
-			return (uint) (Utilities.GetUnixTime() + SteamTimeDifference.GetValueOrDefault());
 		}
 
-		internal sealed class Confirmation {
-			internal readonly uint ID;
-			internal readonly ulong Key;
-			internal readonly Steam.ConfirmationDetails.EType Type;
+		private static async Task LimitConfirmationsRequestsAsync() {
+			if (ASF.ConfirmationsSemaphore == null) {
+				throw new ArgumentNullException(nameof(ASF.ConfirmationsSemaphore));
+			}
 
-			internal Confirmation(uint id, ulong key, Steam.ConfirmationDetails.EType type) {
-				if ((id == 0) || (key == 0) || (type == Steam.ConfirmationDetails.EType.Unknown)) {
-					throw new ArgumentNullException(nameof(id) + " || " + nameof(key) + " || " + nameof(type));
+			byte confirmationsLimiterDelay = ASF.GlobalConfig?.ConfirmationsLimiterDelay ?? GlobalConfig.DefaultConfirmationsLimiterDelay;
+
+			if (confirmationsLimiterDelay == 0) {
+				return;
+			}
+
+			await ASF.ConfirmationsSemaphore.WaitAsync().ConfigureAwait(false);
+
+			Utilities.InBackground(
+				async () => {
+					await Task.Delay(confirmationsLimiterDelay * 1000).ConfigureAwait(false);
+					ASF.ConfirmationsSemaphore.Release();
+				}
+			);
+		}
+
+		private async Task<(bool Success, string? Result)> ResolveDeviceID() {
+			if (Bot == null) {
+				throw new ArgumentNullException(nameof(Bot));
+			}
+
+			string? deviceID = await Bot.ArchiHandler.GetTwoFactorDeviceIdentifier(Bot.SteamID).ConfigureAwait(false);
+
+			if (string.IsNullOrEmpty(deviceID)) {
+				Bot.ArchiLogger.LogGenericWarning(Strings.WarningFailed);
+
+				return (false, null);
+			}
+
+			return (true, deviceID);
+		}
+
+		public sealed class Confirmation {
+			internal readonly ulong Creator;
+			internal readonly ulong ID;
+			internal readonly ulong Key;
+			internal readonly EType Type;
+
+			internal Confirmation(ulong id, ulong key, ulong creator, EType type) {
+				if ((id == 0) || (key == 0) || (creator == 0) || !Enum.IsDefined(typeof(EType), type)) {
+					throw new ArgumentNullException(nameof(id) + " || " + nameof(key) + " || " + nameof(creator) + " || " + nameof(type));
 				}
 
 				ID = id;
 				Key = key;
+				Creator = creator;
 				Type = type;
 			}
+
+			// REF: Internal documentation
+			[PublicAPI]
+			public enum EType : byte {
+				Unknown,
+				Generic,
+				Trade,
+				Market,
+
+				// We're missing information about definition of number 4 type
+				PhoneNumberChange = 5,
+				AccountRecovery = 6
+			}
 		}
-
-#pragma warning disable 649
-		[JsonProperty(PropertyName = "shared_secret", Required = Required.Always)]
-		private readonly string SharedSecret;
-
-		[JsonProperty(PropertyName = "identity_secret", Required = Required.Always)]
-		private readonly string IdentitySecret;
-#pragma warning restore 649
 	}
 }
